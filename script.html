@@ -1,0 +1,147 @@
+import time
+import pickle
+import re
+import os
+from selenium import webdriver
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from bs4 import BeautifulSoup
+import requests
+from openpyxl import Workbook, load_workbook
+
+# Define paths
+session_file = "linkedin_session.pkl"
+output_file = "linkedin_data.xlsx"
+visited_messages_file = "visited_messages.txt"
+download_dir = "downloads"
+
+# Initialize the Chrome WebDriver
+options = webdriver.ChromeOptions()
+options.add_argument("--headless")
+options.add_argument("--no-sandbox")
+options.add_argument("--disable-dev-shm-usage")
+driver = webdriver.Chrome(options=options)
+
+# Load previous session if exists
+def load_session():
+    if os.path.exists(session_file):
+        with open(session_file, 'rb') as f:
+            cookies = pickle.load(f)
+            driver.get("https://www.linkedin.com")
+            for cookie in cookies:
+                driver.add_cookie(cookie)
+            driver.refresh()
+
+# Save session
+def save_session():
+    with open(session_file, 'wb') as f:
+        pickle.dump(driver.get_cookies(), f)
+
+# Function to log in and perform 2FA
+def login():
+    driver.get("https://www.linkedin.com/login")
+    input("Log in and complete 2FA, then press Enter...")
+    save_session()
+
+# Function to scrape messages
+def scrape_messages():
+    driver.get("https://www.linkedin.com/messaging/")
+    time.sleep(5)
+    
+    
+    if os.path.exists(visited_messages_file):
+        with open(visited_messages_file, 'r') as f:
+            visited_messages = set(f.read().splitlines())
+    else:
+        visited_messages = set()
+
+    # Click on each message thread
+    message_threads = driver.find_elements(By.CSS_SELECTOR, '.msg-conversation-listitem__link')
+    for thread in message_threads:
+        contact_name = thread.find_element(By.CSS_SELECTOR, '.msg-conversation-listitem__participant-names').text
+        if contact_name not in visited_messages:
+            thread.click()
+            time.sleep(2)
+
+            
+            scroll_and_scrape(contact_name)
+            visited_messages.add(contact_name)
+
+            
+            with open(visited_messages_file, 'a') as f:
+                f.write(contact_name + '\n')
+
+# Function to scroll and scrape
+def scroll_and_scrape(contact_name):
+    emails = []
+    phones = []
+    links = []
+    files = []
+
+    while True:
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        messages = soup.find_all('div', {'class': 'msg-s-message-list__event'})
+
+        for message in messages:
+            text = message.get_text()
+            emails.extend(re.findall(r'\S+@\S+', text))
+            phones.extend(re.findall(r'\+?\d[\d -]{8,12}\d', text))
+            links.extend(re.findall(r'https?://\S+', text))
+
+            
+            attachments = message.find_all('a', {'class': 'msg-s-message__attachment-link'})
+            for attachment in attachments:
+                file_url = attachment['href']
+                file_name = file_url.split('/')[-1]
+                if 'sent by you' not in attachment.text:  # Ensure it's not sent by you
+                    files.append((file_name, file_url))
+
+        
+        driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.HOME)
+        time.sleep(1)
+        if 'see previous messages' not in driver.page_source.lower():
+            break
+
+    save_data(contact_name, emails, phones, links, files)
+
+# Function to save data
+def save_data(contact_name, emails, phones, links, files):
+    if os.path.exists(output_file):
+        wb = load_workbook(output_file)
+    else:
+        wb = Workbook()
+    
+    if contact_name not in wb.sheetnames:
+        ws = wb.create_sheet(contact_name)
+        ws.append(['Emails', 'Phones', 'Links'])
+    
+    ws = wb[contact_name]
+    for email in set(emails):
+        ws.append([email, '', ''])
+    for phone in set(phones):
+        ws.append(['', phone, ''])
+    for link in set(links):
+        ws.append(['', '', link])
+
+    contact_download_dir = os.path.join(download_dir, contact_name)
+    os.makedirs(contact_download_dir, exist_ok=True)
+
+    for file_name, file_url in files:
+        file_path = os.path.join(contact_download_dir, file_name)
+        with open(file_path, 'wb') as f:
+            f.write(requests.get(file_url).content)
+    
+    wb.save(output_file)
+
+# Main execution
+load_session()
+
+try:
+    scrape_messages()
+except Exception as e:
+    print(f"Error occurred: {e}")
+    save_session()
+finally:
+    driver.quit()
